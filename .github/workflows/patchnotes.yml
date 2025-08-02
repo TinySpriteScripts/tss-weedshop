@@ -1,0 +1,24 @@
+name: Discord Release Notifier
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Notify Discord Bot of new release
+        run: |
+          echo "Sending to ${{ secrets.DISCORDBOT }}/github-release"
+          curl -X POST ${{ secrets.DISCORDBOT }}/github-release \
+            -H "Content-Type: application/json" \
+            -d '{
+              "release": ${{ toJson(github.event.release) }},
+              "repository": ${{ toJson(github.event.repository) }},
+              "discord": {
+                "guild_id": "${{ secrets.GUILDID }}"
+              }
+            }'
