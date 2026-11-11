@@ -1,0 +1,133 @@
+name: Release
+
+# Push a tag (e.g. `git tag v1.2.0 && git push origin v1.2.0`) to build and publish a release.
+# - Any folder with a package.json that has a "build" script is treated as a UI and built (npm, pnpm or yarn).
+# - The zip holds the tracked resource files plus the built UI, without UI sources, node_modules or GitHub files.
+# - `version` in every fxmanifest.lua inside the zip is set from the tag (v1.2.0 -> 1.2.0).
+
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build the release for, e.g. v1.2.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and release
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      REPO_NAME: ${{ github.event.repository.name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Find UIs to build
+        id: ui
+        run: |
+          dirs=""
+          while IFS= read -r file; do
+            if grep -q '"build"[[:space:]]*:' "$file"; then dirs="$dirs $(dirname "$file")"; fi
+          done < <(git ls-files '*package.json' | grep -v node_modules || true)
+          dirs="$(echo "$dirs" | xargs)"
+          echo "dirs=$dirs" >> "$GITHUB_OUTPUT"
+          if [ -n "$dirs" ]; then echo "UI found: $dirs"; else echo "No UI to build"; fi
+
+      - name: Setup Node.js
+        if: steps.ui.outputs.dirs != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build UIs
+        if: steps.ui.outputs.dirs != ''
+        run: |
+          set -euo pipefail
+          corepack enable
+          for dir in ${{ steps.ui.outputs.dirs }}; do
+            echo "::group::Building $dir"
+            (
+              cd "$dir"
+              if [ -f package-lock.json ]; then npm ci && npm run build
+              elif [ -f pnpm-lock.yaml ]; then (pnpm install --frozen-lockfile || pnpm install) && pnpm run build
+              elif [ -f yarn.lock ]; then yarn install --frozen-lockfile && yarn build
+              else npm install && npm run build
+              fi
+            )
+            echo "::endgroup::"
+          done
+
+      - name: Package resource
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          # A repo without a root fxmanifest is a category of resources, e.g. [tss-mlo_lamesa_construction]
+          if [ -f fxmanifest.lua ]; then name="$REPO_NAME"; else name="[$REPO_NAME]"; fi
+          pkg="dist/$name"
+          mkdir -p "$pkg"
+          ui_dirs="${{ steps.ui.outputs.dirs }}"
+
+          git ls-files -z | while IFS= read -r -d '' file; do
+            case "$file" in
+              .github/*|.gitignore|*/.gitignore|.gitattributes|.vscode/*|*.zip|node_modules/*|*/node_modules/*) continue ;;
+            esac
+            for dir in $ui_dirs; do
+              [ "$dir" = "." ] && continue
+              case "$file" in
+                "$dir"/*/*)
+                  sub="${file#"$dir"/}"; sub="${sub%%/*}"
+                  case "$sub" in src|public|node_modules) continue 2 ;; esac ;;
+                "$dir"/*) continue 2 ;; # package.json, configs and the source index.html
+              esac
+            done
+            mkdir -p "$pkg/$(dirname "$file")"
+            cp -p "$file" "$pkg/$file"
+          done
+
+          for dir in $ui_dirs; do
+            for out in build dist; do
+              if [ -d "$dir/$out" ]; then
+                mkdir -p "$pkg/$dir"
+                cp -R "$dir/$out" "$pkg/$dir/"
+                echo "Added built UI $dir/$out"
+              fi
+            done
+          done
+
+          find "$pkg" -name fxmanifest.lua -print0 | xargs -0 -r sed -i -E "s/^([[:space:]]*version[[:space:]]+)(['\"]).*(['\"])/\1\2${version}\3/"
+
+          cd dist
+          zip -qr "$REPO_NAME-$TAG.zip" "$name"
+          echo "Packaged dist/$REPO_NAME-$TAG.zip"
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.REPO_NAME }}-package
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Release $TAG already exists"
+          else
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          fi
+
+      - name: Attach package to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$TAG" "dist/$REPO_NAME-$TAG.zip" --clobber
